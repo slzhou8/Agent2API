@@ -105,9 +105,24 @@ pub const STATUS_FAILED: &str = "failed";
 /// 这里就报「适配器报成功但凭据未更新，请重新登录该账号」—— 用户点「刷新 token」
 /// 得到的是一句把人往重新登录带的话，而其实什么都不用做。
 ///
-/// 因此没写回时**再问一次适配器**：凭证已经不在临期窗口里（`false`）就视为
-/// 「无需刷新」正常返回；只有「确实临期/已过期、却还是没换发」才是真故障
-/// （上游把这份登录态作废了），那时报错并提示重新登录才是对的。
+/// 因此没写回时**再核对一次**：凭证确实不在临期窗口里就视为「无需刷新」正常返回；
+/// 只有「确实临期/已过期、却还是没换发」才是真故障（上游把这份登录态作废了），
+/// 那时报错并提示重新登录才是对的。
+///
+/// ── 为什么不能只信 `credentials_expiring_async` 的 `false` ─────
+/// 该方法的约定是「判不出来就 false」：插件没响应、RPC 失败、插件根本没实现，
+/// 返回的都是同一个 `false`，和「确认未临期」分不开。只看它，等于把「插件挂了」
+/// 当成「无需刷新」，#407 要暴露的静默失效就又被吞回去了。所以这里要求**两个条件
+/// 同时成立**才放行：适配器说不临期，**且**本地记录里读得到一个远未到期的
+/// `expiresAt`（见 [`confirmed_not_expiring`]）。读不到有效期的家（小浣熊的有效期
+/// 在 JWT 里、部分家不写）保持原来的判据：没写回就报错。
+/// 「确认未临期」：本地记录里有一个有效的 `expiresAt`，且距今超过临期窗口。
+///
+/// `expires_at <= 0`（没写 / 读不到）一律返回 `false` —— 那是「未知」，不是「没到期」。
+fn confirmed_not_expiring(expires_at: f64, now_ms: f64) -> bool {
+    expires_at > 0.0 && expires_at - crate::server::core::auth_http::REFRESH_WINDOW_MS > now_ms
+}
+
 pub async fn refresh_checked(
     store: &AccountStore,
     adapter: &dyn ProviderAdapter,
@@ -121,8 +136,10 @@ pub async fn refresh_checked(
     {
         if expires_after <= expires_before && updated_after <= updated_before {
             // 复查必须在 `refresh_access_token` **之后**做：判断依据是刷新结果
-            // 落在记录上的现状，不是调用前的快照。
-            if !adapter.credentials_expiring_async(store, id).await {
+            // 落在记录上的现状，不是调用前的快照。两个条件缺一不可，理由见函数说明。
+            if !adapter.credentials_expiring_async(store, id).await
+                && confirmed_not_expiring(expires_after, logging::now_ms() as f64)
+            {
                 logging::verbose(
                     "[Accounts]",
                     &format!("账号 {id} 的刷新未换发新凭证，但当前仍在有效期内 —— 视为无需刷新"),
@@ -351,5 +368,32 @@ pub fn note_manual_run() {
         interval,
     ) {
         logging::verbose("[Accounts]", &format!("凭证维护排期顺延失败：{error}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::confirmed_not_expiring;
+    use crate::server::core::auth_http::REFRESH_WINDOW_MS;
+
+    const NOW: f64 = 1_700_000_000_000.0;
+
+    #[test]
+    fn a_far_future_expiry_is_confirmed_not_expiring() {
+        assert!(confirmed_not_expiring(NOW + 60.0 * 60_000.0, NOW));
+    }
+
+    /// 读不到有效期是「未知」，不是「没到期」：必须落回「没写回就报错」。
+    #[test]
+    fn an_unknown_expiry_is_never_confirmed() {
+        assert!(!confirmed_not_expiring(0.0, NOW));
+        assert!(!confirmed_not_expiring(-1.0, NOW));
+    }
+
+    #[test]
+    fn an_expiry_inside_the_refresh_window_or_in_the_past_is_not_confirmed() {
+        assert!(!confirmed_not_expiring(NOW + REFRESH_WINDOW_MS, NOW), "刚好踩在窗口边界上仍算临期");
+        assert!(!confirmed_not_expiring(NOW + 1_000.0, NOW));
+        assert!(!confirmed_not_expiring(NOW - 1_000.0, NOW));
     }
 }
