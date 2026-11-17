@@ -54,11 +54,57 @@ where
     }
 }
 
+/// 网关所有 Tokio worker 线程的栈大小。
+///
+/// Tokio worker 线程默认栈 2 MiB。网关的请求处理链（axum handler → 转发管线 →
+/// 协议转换 / 脱敏 / 记账）会为一次请求实例化很大的 async Future 状态机（观测到引用
+/// ≥15 KiB 状态体的 8 KiB poll 函数），2 MiB 默认栈在长上下文大流式请求下已被观测到
+/// 栈溢出硬崩（Windows Event ID 1000，异常码 0xc00000fd；详见 PR #583）。
+/// 提到 16 MiB：只增加虚拟地址空间预留，物理页按实际使用提交。
+///
+/// 桌面（Tauri）、headless、Windows 服务、后台全局运行时**共用这一个常量**：
+/// 任何一条路径漏掉都会让那条路径上的请求仍跑在 2 MiB 栈上。
+pub const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// 按网关约定的栈容量构造多线程运行时（所有入口共用，见 [`WORKER_STACK_BYTES`]）。
+pub fn build_runtime() -> std::io::Result<Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_STACK_BYTES)
+        .build()
+}
+
 fn global_runtime() -> &'static Runtime {
-    GLOBAL_RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("创建后台 Tokio 运行时失败")
-    })
+    GLOBAL_RUNTIME.get_or_init(|| build_runtime().expect("创建后台 Tokio 运行时失败"))
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::{build_runtime, WORKER_STACK_BYTES};
+
+    /// 在栈上放 `bytes` 字节并强制编译器保留它（不内联、不优化掉）。
+    #[inline(never)]
+    fn touch_stack(bytes: usize) -> u8 {
+        assert!(bytes == 4 * 1024 * 1024);
+        let mut buffer = [0u8; 4 * 1024 * 1024];
+        // 每页写一次，保证这些页真的被提交，而不是只在栈指针上做减法。
+        for offset in (0..buffer.len()).step_by(4096) {
+            buffer[offset] = (offset >> 12) as u8;
+        }
+        std::hint::black_box(&buffer);
+        buffer[buffer.len() - 1]
+    }
+
+    /// 网关的 worker 栈必须容得下 4 MiB 的栈帧：Tokio 默认的 2 MiB 会在这里栈溢出直接中止进程，
+    /// 所以这条用例一旦失败就是整个测试进程崩溃，而不是一个普通断言 —— 那正是它要钉住的事故形态。
+    #[test]
+    fn gateway_workers_have_room_for_a_four_mib_frame() {
+        assert!(WORKER_STACK_BYTES >= 8 * 1024 * 1024, "常量被调小了：{WORKER_STACK_BYTES}");
+        let runtime = build_runtime().expect("构造运行时");
+        let value = runtime.block_on(async {
+            // `spawn` 才会落在 worker 线程上（block_on 跑在调用线程，不受 worker 栈设置影响）。
+            tokio::spawn(async { touch_stack(4 * 1024 * 1024) }).await.expect("任务不应 panic")
+        });
+        assert_eq!(value, 0);
+    }
 }

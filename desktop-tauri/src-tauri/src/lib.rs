@@ -248,7 +248,33 @@ pub fn ensure_main_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     create_main_window(app, true).ok()
 }
 
+/// 桌面端的 Tokio 运行时：Tauri 的 `async_runtime::set` 只借句柄，运行时本体必须活到进程结束。
+static DESKTOP_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+/// 把 Tauri 的异步运行时换成网关约定栈容量的那一个。
+///
+/// 桌面形态下，进程内网关的 HTTP 服务经 `agent2api_server::spawn_task` 落在 **Tauri 的
+/// 全局运行时**上（`server::start` 在非 Tokio 上下文里取到的就是它）。Tauri 默认运行时的
+/// worker 栈是 Tokio 默认的 2 MiB，长上下文大流式请求会栈溢出硬崩（见 PR #583）；
+/// headless / Windows 服务 / 后台全局运行时已改用 `build_runtime`，桌面端若不在这里换掉，
+/// 最常用的那条路径反而还跑在 2 MiB 上。
+///
+/// 必须在**任何** `tauri::async_runtime` 调用之前执行（再次设置会 panic），所以放在 `run()` 最前面。
+/// 创建失败不致命：退回 Tauri 默认运行时，只是丢掉栈加固，并在日志里留一行。
+fn install_desktop_runtime() {
+    match agent2api_server::build_runtime() {
+        Ok(runtime) => {
+            let handle = runtime.handle().clone();
+            if DESKTOP_RUNTIME.set(runtime).is_ok() {
+                tauri::async_runtime::set(handle);
+            }
+        }
+        Err(error) => eprintln!("创建桌面 Tokio 运行时失败，沿用 Tauri 默认运行时（worker 栈 2 MiB）：{error}"),
+    }
+}
+
 pub fn run() {
+    install_desktop_runtime();
     let mut builder = tauri::Builder::default();
 
     // 单实例必须第一个注册：插件按注册顺序执行，晚于其它插件时，

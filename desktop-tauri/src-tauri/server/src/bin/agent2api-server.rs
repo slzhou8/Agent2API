@@ -132,10 +132,9 @@ fn run_foreground(launch: Launch) -> ExitCode {
 
     // 停机信号：Ctrl+C（全平台）+ SIGTERM（unix，容器 stop 走这条）；
     // 「面板发起的重启」与两者同一条收尾路径（见 `start_gateway` 的说明）。
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
+    //
+    // 运行时统一走 `build_runtime`（worker 栈 16 MiB，理由见 lib.rs `WORKER_STACK_BYTES`）。
+    let runtime = match agent2api_server::build_runtime() {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("❌ 创建 Tokio 运行时失败: {error}");
@@ -297,9 +296,9 @@ fn run_as_windows_service(launch: Launch) -> ExitCode {
         //   · SCM 的 STOP / SHUTDOWN 控制事件（`sc.exe stop`、关机）；
         //   · 面板「安装并重启」的自更新钩子（替文件后要求进程退出，
         //     由 SCM 的恢复策略把新版本拉起来 —— 与容器 restart 同语义）。
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
+        //
+        // 运行时统一走 `build_runtime`（worker 栈 16 MiB，理由见 lib.rs `WORKER_STACK_BYTES`）。
+        let runtime = agent2api_server::build_runtime()
             .map_err(|error| format!("创建 Tokio 运行时失败: {error}"))?;
         runtime.block_on(async move {
             tokio::select! {
