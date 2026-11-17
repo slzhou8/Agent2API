@@ -1186,7 +1186,50 @@ fn panel_boot_redirect(request: &Request) -> Option<Response> {
     // 手机端带上 `next=/m`，登录页据此回到手机面板而不是桌面面板
     // （白名单校验在 login.html 的 postLoginTarget 里）。
     let location = if is_mobile { "/login?next=%2Fm" } else { "/login" };
+    // 子路径反代（`example.com/panel/*` → 本服务根）时，`/login` 是**宿主域名下**的
+    // 绝对路径，浏览器会被送到宿主自己的 `/login` —— 那里没有这张面板，在 iframe 或
+    // 嵌入式控制台里表现为「点去登录毫无反应」（302 目标落在宿主身上，宿主再兜回自己的
+    // 首页）。反代如果声明了 `X-Forwarded-Prefix`，把前缀补上即可；
+    // 没声明就维持原来的绝对根路径，直连部署的行为一点不变。
+    let location = match forwarded_prefix(request) {
+        Some(prefix) => format!("{prefix}{location}"),
+        None => location.to_string(),
+    };
     Some((StatusCode::FOUND, [(header::LOCATION, location)]).into_response())
+}
+
+/// 取反代声明的挂载前缀（标准请求头 `X-Forwarded-Prefix`），只接受干净的路径段。
+///
+/// 不拿 `Referer`、`Host` 这类值去猜：凡是要拼进 `Location` 的东西必须由反代自己声明，
+/// 否则就凭空多出一个开放跳转（把头里的值当成跳转目标）。
+///
+/// 返回值会被原样写进两个地方：302 的 `Location`，以及登录页 / 面板页 `<head>` 里的
+/// 内联 `<script>`（`static_files::panel_base_script`）。后者不做 HTML 转义，所以这里
+/// 把字符集收窄到 URL 路径的安全字符：`<`、`>`、引号、反斜杠、空白与控制字符一律拒绝，
+/// 否则一个 `/</script><script>…` 就能跳出内联脚本（反射型 XSS），`\` 还能在部分浏览器里
+/// 把 `/\evil.com` 解析成协议相对地址（开放跳转）。
+pub(crate) fn forwarded_prefix(request: &Request) -> Option<String> {
+    let prefix = request.headers().get("x-forwarded-prefix")?.to_str().ok()?;
+    sanitize_forwarded_prefix(prefix)
+}
+
+fn sanitize_forwarded_prefix(raw: &str) -> Option<String> {
+    let prefix = raw.trim().trim_end_matches('/');
+    if prefix.is_empty() || !prefix.starts_with('/') {
+        return None;
+    }
+    if prefix.contains("//") || prefix.contains("..") {
+        return None;
+    }
+    // 白名单：字母数字与 `- . _ ~ /`（RFC 3986 unreserved + 路径分隔符）。
+    // 含 `%` 的百分号编码也不收 —— 挂载前缀没有需要编码的场景，放进来只会增加歧义。
+    if !prefix
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/'))
+    {
+        return None;
+    }
+    Some(prefix.to_string())
 }
 
 /// 写入三个 CORS 头 + 一个 Private Network Access 许可（值固定，不会失败；
@@ -1567,5 +1610,47 @@ mod cors_tests {
             headers.get(header::ACCESS_CONTROL_ALLOW_HEADERS).unwrap(),
             CORS_HEADERS
         );
+    }
+}
+
+#[cfg(test)]
+mod forwarded_prefix_tests {
+    //! `X-Forwarded-Prefix` 的取值白名单。
+    //!
+    //! 这个值会被写进登录页的内联 `<script>` 和 302 的 `Location`，所以必须在入口处就
+    //! 拒掉能跳出脚本块或改写跳转目标的字符，而不是指望下游转义。
+
+    use super::sanitize_forwarded_prefix as clean;
+
+    #[test]
+    fn accepts_plain_mount_paths_and_trims_trailing_slash() {
+        assert_eq!(clean("/panel").as_deref(), Some("/panel"));
+        assert_eq!(clean("/panel/").as_deref(), Some("/panel"));
+        assert_eq!(clean("  /a/b-c_d.e~f  ").as_deref(), Some("/a/b-c_d.e~f"));
+    }
+
+    #[test]
+    fn rejects_values_that_can_break_out_of_an_inline_script() {
+        for bad in [
+            "/</script><script>alert(1)</script>",
+            "/a<b",
+            "/a>b",
+            "/a\"b",
+            "/a'b",
+            "/a`b",
+            "/a\\b",
+            "/a b",
+            "/a\nb",
+            "/a\u{2028}b",
+        ] {
+            assert_eq!(clean(bad), None, "应拒绝：{bad:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_open_redirect_and_traversal_shapes() {
+        for bad in ["//evil.com", "/a//b", "/../x", "/a/..", "evil.com", "", "/", "http://evil.com", "/a?x=1", "/a#x", "/a%2fb"] {
+            assert_eq!(clean(bad), None, "应拒绝：{bad:?}");
+        }
     }
 }
