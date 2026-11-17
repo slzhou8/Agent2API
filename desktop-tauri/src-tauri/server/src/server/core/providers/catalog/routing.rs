@@ -29,7 +29,7 @@ pub(crate) fn entry_id_in_manifest(manifest: &[Value], requested: &str) -> Optio
         .map(model_id)
 }
 
-pub(super) fn builtin_target(
+pub(crate) fn builtin_target(
     rules: &model_rules::ModelRules,
     provider: &str,
     manifest: &[Value],
@@ -122,6 +122,35 @@ pub fn forwarding_providers(model: &str) -> Vec<String> {
     result
 }
 
+/// 该提供商当前能否把这只**上游真实 id** 的模型发出去。
+///
+/// 图片兼容的视觉目标按上游真实 id 存储，而模型管理里原始 id 的默认绑定可能
+/// 被关闭、指向它的别名仍然启用（界面上启用的正是别名），可达性判断必须把
+/// 别名路径算上，否则保存与运行时会把这类目标误判成「尚未启用」。
+pub fn provider_serves_model(provider: &str, upstream_model: &str) -> bool {
+    if custom_providers::is_custom_provider_id(provider) {
+        return custom_providers::carriers_of_model(upstream_model).iter().any(|id| id == provider);
+    }
+    builtin_serves_model(&model_rules::shared(), provider, &manifest_for_provider(provider), upstream_model)
+}
+
+/// [`provider_serves_model`] 的内置家判据：只依赖规则与清单，便于单测。
+fn builtin_serves_model(
+    rules: &model_rules::ModelRules,
+    provider: &str,
+    manifest: &[Value],
+    upstream_model: &str,
+) -> bool {
+    let Some(upstream) = entry_id_in_manifest(manifest, upstream_model) else { return false; };
+    if rules.default_enabled(provider, &upstream) { return true; }
+    rules.mappings.iter().any(|mapping| {
+        mapping.enabled
+            && mapping.provider.as_deref().map_or(true, |owner| owner.eq_ignore_ascii_case(provider))
+            && entry_id_in_manifest(manifest, &mapping.target)
+                .is_some_and(|target| target.eq_ignore_ascii_case(&upstream))
+    })
+}
+
 /// 「这个名字是不是被关掉了」—— 只在广告里没有它时用来区分「承载家全被关闭」
 /// 与「根本没有这个名字」两种 404 文案（`pipeline::resolve_model` 与
 /// `provider_loop::forward_with_providers` 各判一次）。
@@ -175,4 +204,57 @@ pub fn default_model_catalog() -> Vec<Value> {
 
 pub fn default_model_usable(model: &str) -> bool {
     entry_id_in_manifest(&default_model_catalog(), model).is_some()
+}
+
+#[cfg(test)]
+mod serves_model_tests {
+    //! 图片兼容的视觉目标按**上游真实 id** 存储；模型管理里常见的形态是：
+    //! 原始 id 的默认绑定被关掉，界面上启用的是指向它的别名。可达性判断必须把别名路径
+    //! 算上，否则保存与运行时都会把这类目标误判成「尚未启用」。
+
+    use super::builtin_serves_model;
+    use crate::server::core::model_rules::ModelRules;
+    use serde_json::{json, Value};
+
+    fn rules(disabled: &[&str], mappings: Value) -> ModelRules {
+        let raw = json!({ "modelRules": { "disabled": disabled, "mappings": mappings } });
+        ModelRules::from_raw(raw.as_object().expect("测试对象"))
+    }
+
+    fn manifest() -> Vec<Value> {
+        vec![json!({ "id": "real-model" })]
+    }
+
+    #[test]
+    fn an_unknown_model_is_not_served() {
+        assert!(!builtin_serves_model(&rules(&[], json!([])), "demo", &manifest(), "no-such-model"));
+    }
+
+    #[test]
+    fn a_default_enabled_model_is_served() {
+        assert!(builtin_serves_model(&rules(&[], json!([])), "demo", &manifest(), "real-model"));
+    }
+
+    #[test]
+    fn a_disabled_default_binding_with_no_alias_is_not_served() {
+        assert!(!builtin_serves_model(&rules(&["real-model"], json!([])), "demo", &manifest(), "real-model"));
+    }
+
+    #[test]
+    fn an_enabled_alias_keeps_a_disabled_upstream_id_reachable() {
+        let mappings = json!([{ "alias": "friendly", "target": "real-model", "provider": "demo" }]);
+        assert!(builtin_serves_model(&rules(&["real-model"], mappings), "demo", &manifest(), "real-model"));
+    }
+
+    #[test]
+    fn a_disabled_alias_does_not_make_the_model_reachable() {
+        let mappings = json!([{ "alias": "friendly", "target": "real-model", "provider": "demo", "enabled": false }]);
+        assert!(!builtin_serves_model(&rules(&["real-model"], mappings), "demo", &manifest(), "real-model"));
+    }
+
+    #[test]
+    fn an_alias_owned_by_another_provider_does_not_count() {
+        let mappings = json!([{ "alias": "friendly", "target": "real-model", "provider": "other" }]);
+        assert!(!builtin_serves_model(&rules(&["real-model"], mappings), "demo", &manifest(), "real-model"));
+    }
 }
