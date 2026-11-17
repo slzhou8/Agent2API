@@ -102,11 +102,13 @@ pub fn state(account: &Value, group: &Group, facts: &sources::Facts, counts: &co
     }
     let mut hit = false;
     let mut account_hit = false;
+    let mut local_hit = false;
     let mut models = Vec::new();
     if group.enabled {
         for branch in branches {
             if !branch.iter().all(|index| readings[*index].hit) { continue; }
             hit = true;
+            local_hit |= branch.iter().any(|index| readings[*index].local);
             let mut branch_models = Vec::new();
             for index in branch {
                 for model in &readings[index].models {
@@ -123,25 +125,26 @@ pub fn state(account: &Value, group: &Group, facts: &sources::Facts, counts: &co
             }
         }
     }
-    GroupState { hit, account: hit && (group.target == Target::Account || account_hit), models, conditions: readings }
+    GroupState { hit, account: hit && (group.target == Target::Account || account_hit), models, conditions: readings, local_hit }
 }
 
 /// 模型条目里的倍率读数；`None` = 目录没有可判定的计费信息。
 ///
 /// 字段优先级：`billingEffectiveMultiplier` > `billingMultiplier` >
-/// `pointsMultiplier` > `multiplier` > `rate` > `credits` 展示串。
-/// 0 与负数都按「免费」处理（负数只可能是上游异常读数，按不消耗积分更安全）；
-/// 非有限值直接丢弃，避免把 NaN / Infinity 当成免费。
+/// `pointsMultiplier` > `credits` / `creditMultiplier` 展示串。
+///
+/// 只认明确叫「倍率」的专用字段：`rate`、`multiplier` 这类通用名在别处可能是费率、
+/// 速率或别的东西，数值型 `credits` 也可能是价格而不是倍率，把它们当成 0 会让限制器
+/// 放行本不该放行的请求，所以不读。负数与非有限值都视为「读不出来」（`None`）：
+/// 异常读数不能被当成免费，宁可继续按原规则拦截。
 fn multiplier_of(model: &Value) -> Option<f64> {
     for key in [
         "billingEffectiveMultiplier",
         "billingMultiplier",
         "pointsMultiplier",
-        "multiplier",
-        "rate",
     ] {
         if let Some(value) = model.get(key).and_then(Value::as_f64) {
-            if value.is_finite() {
+            if value.is_finite() && value >= 0.0 {
                 return Some(value);
             }
         }
@@ -149,13 +152,8 @@ fn multiplier_of(model: &Value) -> Option<f64> {
     // 展示串形态：`x0.00 credits` / `x0.0` / `x0.5 credits` / `0.7x` / `免费`。
     // `creditMultiplier` 是 Tabbit 的字段名；`credits` 是其余各家的通用字段。
     for key in ["credits", "creditMultiplier"] {
-        let Some(value) = model.get(key) else { continue };
-        if let Some(number) = value.as_f64() {
-            if number.is_finite() {
-                return Some(number);
-            }
-        }
-        let Some(text) = value.as_str() else { continue };
+        // 只读字符串展示串；数值型 `credits` 语义不明，不读。
+        let Some(text) = model.get(key).and_then(Value::as_str) else { continue };
         let text = text.trim();
         if text == "免费" {
             return Some(0.0);
@@ -171,7 +169,7 @@ fn multiplier_of(model: &Value) -> Option<f64> {
             .or_else(|| number.strip_suffix('X'))
             .unwrap_or(number);
         if let Ok(value) = number.parse::<f64>() {
-            if value.is_finite() {
+            if value.is_finite() && value >= 0.0 {
                 return Some(value);
             }
         }
@@ -212,16 +210,29 @@ fn is_free_model(provider: &str, model: &str) -> bool {
     model_multiplier(provider, model).is_some_and(|multiplier| multiplier <= 0.0)
 }
 
-/// 命中里是否只有余额/额度条件。
+/// 这次拦截是否完全来自余额/额度条件。
 ///
 /// `local = true` 的是 Token / 请求数这类**本地消耗保护**，不是账号积分；
-/// 免费模型可以豁免前者，但不该豁免后者。
-fn only_balance_conditions(conditions: &[Reading]) -> bool {
-    conditions.iter().filter(|reading| reading.hit).all(|reading| !reading.local)
+/// 免费模型可以豁免余额，但不该豁免本地保护。只看**成立的合取分支**（`GroupState::local_hit`）：
+/// 组内条件以 OR 连接时，未成立分支里碰巧命中的本地条件不该让免费模型继续被拦。
+fn only_balance_hit(state: &GroupState) -> bool {
+    !state.local_hit
 }
 
 pub fn blocked(account: &Value, model: &str, facts: &sources::Facts, counts: &counter::Facts, now: i64) -> bool {
     let provider = crate::server::core::routing::provider_of(account);
+    blocked_with(account, model, facts, counts, now, |model| is_free_model(provider, model))
+}
+
+/// `blocked` 的实体：「该模型当前是否限时免费」由调用方注入，测试里不必碰全局目录。
+fn blocked_with(
+    account: &Value,
+    model: &str,
+    facts: &sources::Facts,
+    counts: &counter::Facts,
+    now: i64,
+    is_free: impl Fn(&str) -> bool,
+) -> bool {
     // 目录查询只在「确实有余额条件命中」时发生一次：多数账号不会走到这里。
     let mut free: Option<bool> = None;
     groups::effective_groups(account).iter().any(|group| {
@@ -233,9 +244,8 @@ pub fn blocked(account: &Value, model: &str, facts: &sources::Facts, counts: &co
         if !matched { return false; }
         // 倍率 0 的限时免费模型不消耗账号积分：纯余额/额度条件的命中不生效。
         // Token / 请求数限制仍然生效（那是本地保护，与积分无关）。
-        if !model.is_empty() && only_balance_conditions(&state.conditions) {
-            let is_free = *free.get_or_insert_with(|| is_free_model(provider, model));
-            if is_free { return false; }
+        if !model.is_empty() && only_balance_hit(&state) {
+            if *free.get_or_insert_with(|| is_free(model)) { return false; }
         }
         true
     })

@@ -183,6 +183,10 @@ pub struct GroupState {
     pub account: bool,
     pub models: Vec<String>,
     pub conditions: Vec<Reading>,
+    /// 成立的合取分支里是否含本地消耗保护（Token / 请求数）。只看**成立**的分支：
+    /// 未成立分支里恰好命中的条件不代表这次拦截是它造成的。限时免费模型的余额豁免
+    /// 依赖它：只有拦截完全来自余额类条件时才能放行。
+    pub local_hit: bool,
 }
 
 pub fn json_of<T: Serialize>(value: &T) -> Value {
