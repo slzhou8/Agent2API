@@ -151,6 +151,7 @@ mod tests {
         );
         stats.update_running(id, &RunningProgress {
             provider: "trae".to_string(),
+            client: String::new(),
             account_id: account_id.to_string(),
             account_name: "mojie126".to_string(),
             upstream_model: model.to_string(),
@@ -238,6 +239,7 @@ mod tests {
             "req-1",
             &RunningProgress {
                 provider: "trae".to_string(),
+                client: String::new(),
                 account_id: "acct-trae".to_string(),
                 account_name: "mojie126".to_string(),
                 upstream_model: "deepseek-v4.1-flash".to_string(),
