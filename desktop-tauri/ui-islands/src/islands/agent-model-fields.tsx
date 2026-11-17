@@ -5,6 +5,7 @@ import type { AgentClient, AgentModel, AgentProfile } from './agent-types'
 import { catalogModel, type CatalogModel } from './agent-catalog'
 import { AgentSelect, ClaudeModelFields, GatewayModelSelect, TextField } from './agent-fields'
 import { blankModel, syncClaudeTiers } from './agent-model'
+import { newCorrelationId } from '../../../ui-shared/correlation-id'
 import { AgentModelPicker, AGENT_MODEL_LIMIT, SearchableModelSelect } from './agent-model-picker'
 import { selectProfileModels } from './agent-quick-model'
 import { modelFields, modelFieldNote, modelLevels } from './agent-model-config'
@@ -28,7 +29,7 @@ export function ModelsFields({ client, draft, update, catalog, disabled, native 
   const keys = React.useRef(new WeakMap<AgentModel, string>())
   const rowKey = (model: AgentModel) => {
     let key = keys.current.get(model)
-    if (!key) { key = crypto.randomUUID(); keys.current.set(model, key) }
+    if (!key) { key = newCorrelationId(); keys.current.set(model, key) }
     return key
   }
   const change = (index: number, patch: Partial<AgentModel>) => update({ models: draft.models.map((model, i) => {
