@@ -28,10 +28,14 @@ pub(super) struct Cache {
     pub github_unreadable: Vec<UnreadableManifest>,
 }
 
+/// 直接序列化给前端（`githubFailures`），前端读 `retryAt`，所以对外用 camelCase；
+/// `alias` 保证升级前以 `retry_at` 落盘的旧缓存仍能读回。
 #[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct CatalogFailure {
     pub repository: String,
     pub message: String,
+    #[serde(alias = "retry_at")]
     pub retry_at: i64,
 }
 
@@ -121,4 +125,32 @@ pub(super) fn status() -> Value {
         "githubMissing": state.cache.github_missing, "topic": super::github::TOPIC,
         "githubFailures": state.cache.github_failures, "githubUnreadable": state.cache.github_unreadable,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CatalogFailure;
+    use serde_json::json;
+
+    /// 前端（`plugins.ts` 的 `githubFailures`）读的是 `retryAt`；字段若回到 snake_case，
+    /// 「将在 N 秒后自动重试」会永远不显示，且没有任何报错。
+    #[test]
+    fn failure_serializes_retry_at_in_camel_case() {
+        let value = serde_json::to_value(CatalogFailure {
+            repository: "owner/repo".into(),
+            message: "HTTP 429".into(),
+            retry_at: 1_700_000_000_000,
+        })
+        .unwrap();
+        assert_eq!(value["retryAt"], json!(1_700_000_000_000_i64));
+        assert!(value.get("retry_at").is_none(), "不应再输出 snake_case 字段：{value}");
+    }
+
+    /// 升级前落盘的缓存里字段叫 `retry_at`，读回时不能丢。
+    #[test]
+    fn failure_reads_legacy_snake_case_cache() {
+        let failure: CatalogFailure =
+            serde_json::from_value(json!({"repository": "a/b", "message": "x", "retry_at": 42})).unwrap();
+        assert_eq!(failure.retry_at, 42);
+    }
 }
