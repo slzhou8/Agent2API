@@ -308,6 +308,48 @@ fn direct_switch_status(status: i64) -> bool {
         .unwrap_or(false)
 }
 
+/// 402（Payment Required / 积分不足）统一归一为**账号级额度耗尽**。
+///
+/// 与 429 同一处置：标记该账号×模型的冷却，然后换下一个候选。不能只依赖
+/// 「指定错误码直接换号」名单 —— 名单是用户可清空的；清空后 strict/stateful
+/// 的早退门会把 402 当普通 Fatal 直接收尾，连当前请求都不换号。而 402 本身
+/// 也没有像 429 那样落 `rateLimits` 冷却，下一条请求还会再选它。
+///
+/// 适配器已经声明 QuotaLimited / TokenExpired / ContentBlocked 的，保持原分类。
+fn credit_exhausted(status: u16, class: UpstreamErrorClass) -> UpstreamErrorClass {
+    if status != 402 {
+        return class;
+    }
+    match class {
+        UpstreamErrorClass::Fatal { message, upstream_code, .. } => UpstreamErrorClass::QuotaLimited {
+            status: 402,
+            message,
+            upstream_code,
+            reset_at: None,
+        },
+        other => other,
+    }
+}
+
+/// 无状态路径：一次 `failure.stop` 失败，是「到此为止」还是「只是本账号不再原地重发」？
+///
+/// 返回 `true` = 整条请求收尾（把错误给客户端）；`false` = 放行，让下一步按队列换号。
+///
+/// `stop`（`RetryDecision::Stop` / 生图不确定 / 视觉拒绝等）只表示「本账号不再**原地重发**」，
+/// 对上游 4xx/5xx 来说换下一个候选仍可能成功，所以放行；但有三类必须收尾：
+///  · `policy_stop`：插件**显式**要求终止整条请求（会话持有待回传的工具结果等），优先级最高；
+///  · 生图（`is_image`）：上游可能已经计费，换号重发会重复扣额度；
+///  · 状态码不在 4xx/5xx：手动终止（408/499 一类的本地状态）、传输层与非 HTTP 错误。
+fn stateless_stop_ends_request(stop: bool, policy_stop: bool, is_image: bool, status: u16) -> bool {
+    if !stop && !policy_stop {
+        return false;
+    }
+    if policy_stop || is_image {
+        return true;
+    }
+    !(400..600).contains(&status)
+}
+
 /// 瞬时 HTTP 错误的统一退避建议（设置页「请求重试」的全局兜底）。
 ///
 /// `remaining` 是原地重发**还剩几次**（见 [`RetryBudget`] 的说明）；
@@ -744,6 +786,11 @@ async fn attempt_queue(
             match attempt_custom(service, ctx, target, slot, connections, degraded).await {
                 Ok(outcome) => {
                     if let Some(account_id) = custom_account_id.as_deref() {
+                        // 与内置 / 会话式成功路径同款：成功要喂熔断恢复计数。
+                        let route_settings = ctx.routing.settings;
+                        if route_settings.breaker_enabled {
+                            service.route.breaker_success(account_id, route_settings.breaker_success_threshold);
+                        }
                         service.route.sticky_bind(
                             &conv_key, &model, &attempt_key, sticky_source, logging::now_ms(),
                             ctx.routing.settings.sticky.ttl_ms().unwrap_or(0), sticky_generation,
@@ -779,7 +826,8 @@ async fn attempt_queue(
                             // 并进 message、`mark_account_limited` 内部再解析）。
                             // 自定义家没有「同名多池」之类的键重排，冷却键
                             // 与发送名同源（`custom::forward::cooldown_model`）。
-                            if error.is_quota_limit() {
+                            // 402（积分不足）与 429 同一处置：标记冷却后顺延。
+                            if error.is_quota_limit() || error.status_code == 402 {
                                 let wire_model = if ctx.routing.group.is_some() { selected_model.clone() } else {
                                     custom_forward::cooldown_model(&custom_provider_id, &model)
                                 };
@@ -875,6 +923,9 @@ async fn attempt_queue(
             // 它失败了就把它记入已尝试、回到循环挑下一个账号 —— 可能已经换了一家。
             // 没有下一个可用账号时，把这个错误原样透传（它的文案最贴近真实原因）。
             let stateful_account_id = target.account_id.clone();
+            // `attempt_stateful` 会接管 `target`；熔断日志需要账号展示名，
+            // 所以在移动之前留一份只读副本。
+            let stateful_account = target.account.clone();
             let strict_runtime = crate::server::core::providers::is_scoped_runtime_provider(provider_id);
             match attempt_stateful(
                 service,
@@ -891,6 +942,12 @@ async fn attempt_queue(
             {
                 Ok(outcome) => {
                     if let Some(account_id) = stateful_account_id.as_deref() {
+                        // 会话式成功也要喂熔断恢复计数：否则半开状态的账号
+                        // 永远等不到「连续成功 N 次关闭」的那一步。
+                        let route_settings = ctx.routing.settings;
+                        if route_settings.breaker_enabled {
+                            service.route.breaker_success(account_id, route_settings.breaker_success_threshold);
+                        }
                         service.route.sticky_bind(
                             &conv_key, &model, &attempt_key, sticky_source, logging::now_ms(),
                             ctx.routing.settings.sticky.ttl_ms().unwrap_or(0), sticky_generation,
@@ -931,9 +988,21 @@ async fn attempt_queue(
                     // 整份 `class` 交给 `mark_conversation_limited` 而不是在这里
                     // 拆散取值 —— 拆散后「漏带一个字段」编译期与运行期都不报错
                     // （本分支此前就把 `reset_at` 写成死 `None`，见那个函数的说明）。
-                    let class = adapter.classify_conversation_error(&error);
-                    // 会话可能持有待回传的工具结果，显式停止策略优先于账号顺延。
-                    let policy = adapter.error_policy_async(error.status_code as u16, &serde_json::json!({
+                    let class = credit_exhausted(
+                        u16::try_from(error.status_code).unwrap_or(0),
+                        adapter.classify_conversation_error(&error),
+                    );
+                    // ── 上游错误：哪些收尾、哪些顺延 ──────────────────────────
+                    // 收尾（原样返回客户端）：
+                    //  · 显式 `policy.stop`：会话可能持有待回传的工具结果，换号会丢状态，
+                    //    优先级高于任何顺延；
+                    //  · scoped / 转发型运行时的 Fatal（401/403/WAF/超时等）：由原生 loader 自己
+                    //    处理，宿主不替它改成账号顺延（见下面的 strict 门，保持原样）。
+                    // 其余错误落到下面按队列顺延。本分支对 4xx/5xx 的顺延行为与改动前一致；
+                    // 这里新增的只有两点：402 归一成额度耗尽（落冷却，而不是被当成 Fatal 透传），
+                    // 以及顺延前把失败记入退避/熔断（见下面的失败钩子）。
+                    let status = u16::try_from(error.status_code).unwrap_or(0);
+                    let policy = adapter.error_policy_async(status, &serde_json::json!({
                         "message": error.message,
                         "code": error.code,
                         "upstreamCode": error.upstream_code,
@@ -943,9 +1012,11 @@ async fn attempt_queue(
                         return Err(error);
                     }
                     // Scoped runtime 的原生 loader 已拥有单次 token 恢复；宿主不再消费
-                    // refresh，也不把 Fatal/权限/WAF/取消/超时改成账号顺延。
+                    // refresh，也不把 Fatal/权限/WAF/取消/超时改成账号顺延 —— 这道闸
+                    // 保持原样，只是 402 已在上面归一成 QuotaLimited 而能放行。
                     if (strict_runtime || adapter.forwards_response() && !adapter.is_stateful())
-                        && !account_unavailable && !matches!(&class, UpstreamErrorClass::QuotaLimited { .. }) {
+                        && !account_unavailable
+                        && !matches!(&class, UpstreamErrorClass::QuotaLimited { .. }) {
                         return Err(error);
                     }
                     if let (UpstreamErrorClass::QuotaLimited { .. }, Some(account_id)) =
@@ -968,6 +1039,45 @@ async fn attempt_queue(
                                 account_id, label,
                             ),
                         );
+                    }
+                    // ── 路由状态的失败钩子（与无状态动作 3 同款）──────────
+                    // 会话式分支此前只记 tried_ids，不记退避 / 熔断；于是
+                    // Tabbit / qwenwork / CatPaw 这类会话式家连续失败也永远不熔断，
+                    // 自定义路由组里会反复被选中。429 额度冷却走上面的专属路径，
+                    // 不在这里重复记账。
+                    if let Some(account_id) = stateful_account_id.as_deref() {
+                        // 限额走上面的专属冷却；内容拦截是「误报」信号、不罚账号
+                        // （见 `UpstreamErrorClass::ContentBlocked` 的契约），都不计入退避/熔断。
+                        if !matches!(
+                            &class,
+                            UpstreamErrorClass::QuotaLimited { .. } | UpstreamErrorClass::ContentBlocked { .. }
+                        ) {
+                            let route_settings = ctx.routing.settings;
+                            let now = logging::now_ms();
+                            if route_settings.failover_backoff {
+                                service.route.backoff_mark(account_id, now);
+                            }
+                            if route_settings.breaker_enabled {
+                                let opened = service.route.breaker_failure(
+                                    account_id,
+                                    route_settings.breaker_threshold,
+                                    route_settings.breaker_timeout_seconds,
+                                    now,
+                                );
+                                if opened {
+                                    logging::console_line(
+                                        "[Upstream]",
+                                        &format!(
+                                            "⛔ 账号 {} 连续失败 {} 次，熔断 {} 秒（到点放行试一次，连续成功 {} 次恢复）",
+                                            account_display(stateful_account.as_ref().unwrap_or(&Value::Null)),
+                                            route_settings.breaker_threshold,
+                                            route_settings.breaker_timeout_seconds,
+                                            route_settings.breaker_success_threshold,
+                                        ),
+                                    );
+                                }
+                            }
+                        }
                     }
                     match rotate::pick_next_account(
                         service,
@@ -1474,7 +1584,16 @@ async fn attempt_queue(
                             });
                         }
                     }
-                    if failure.stop || failure.policy.stop {
+                    // ── 终止与顺延的边界 ─────────────────────────────────────
+                    // `failure.stop` 有两个来源，语义不同，必须分开看：
+                    //  · `RetryDecision::Stop`（只是「本账号不再**原地重发**」）：上游 4xx/5xx 时
+                    //    换下一个候选仍可能成功，这里放行去换号；
+                    //  · `policy.stop`（插件**显式**要求终止整条请求，例如会话持有待回传的
+                    //    工具结果、换号会丢状态）：优先级最高，任何状态码都直接收尾。
+                    // 另外这几类本来就不能换号，维持原来的直接收尾：生图（上游可能已计费，
+                    // 重发会重复扣额度）、手动终止（499）、没有 HTTP 状态码的非上游错误。
+                    let status = u16::try_from(failure.error.status_code).unwrap_or(0);
+                    if stateless_stop_ends_request(failure.stop, failure.policy.stop, ctx.images.is_some(), status) {
                         ctx.telemetry.finish_last_attempt(
                             Some(i64::from(failure.error.status_code)),
                             Some(&failure.error.message),
@@ -3106,7 +3225,13 @@ async fn send_with_retry(
             },
             error,
             stop: true,
-            policy: Default::default(),
+            // 上游已经回了 2xx：请求很可能已被执行（甚至计费），只是「这是不是错误响应」
+            // 判定失败。此时换号重发会重复执行，必须显式收尾（`policy.stop` 优先于顺延）。
+            policy: crate::server::core::providers::policy::ErrorPolicy {
+                stop: true,
+                reason: "上游已返回 2xx 但响应类型无法判定，结果不确定，未自动换号".to_string(),
+                ..Default::default()
+            },
         })?;
         if !is_error {
             network.success();
@@ -3134,6 +3259,7 @@ async fn send_with_retry(
         let body = detail.to_value();
         let mut class = adapter.classify_error_async(status, &body).await;
         super::retry_after::apply(&mut class, header_reset);
+        class = credit_exhausted(status, class);
         let policy = adapter.error_policy_async(status, &body).await;
         let decision = adapter
             .retry_decision_async(status, &body, budget.used(), budget.total)

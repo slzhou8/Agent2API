@@ -469,3 +469,78 @@ fn every_retry_advice_stops_when_the_budget_is_exhausted() {
     };
     assert!(transport_retry_advice(&error, 0).is_none());
 }
+
+#[test]
+fn payment_required_is_normalized_to_an_account_level_quota() {
+    let class = credit_exhausted(
+        402,
+        UpstreamErrorClass::Fatal {
+            status: 402,
+            message: "积分不足".into(),
+            upstream_code: Some(7),
+        },
+    );
+    match class {
+        UpstreamErrorClass::QuotaLimited { status, message, upstream_code, reset_at } => {
+            assert_eq!(status, 402);
+            assert_eq!(message, "积分不足");
+            assert_eq!(upstream_code, Some(7));
+            assert_eq!(reset_at, None);
+        }
+        other => panic!("402 应归一为 QuotaLimited，实际 {other:?}"),
+    }
+    // 其他状态码不改变分类
+    let class = credit_exhausted(
+        400,
+        UpstreamErrorClass::Fatal {
+            status: 400,
+            message: "bad".into(),
+            upstream_code: None,
+        },
+    );
+    assert!(matches!(class, UpstreamErrorClass::Fatal { status: 400, .. }));
+    // 适配器已经声明的 QuotaLimited 保持原值（包括已有的 reset_at）
+    let class = credit_exhausted(
+        402,
+        UpstreamErrorClass::QuotaLimited {
+            status: 402,
+            message: "quota".into(),
+            upstream_code: None,
+            reset_at: Some(1),
+        },
+    );
+    assert!(matches!(class, UpstreamErrorClass::QuotaLimited { reset_at: Some(1), .. }));
+}
+
+/// 「Stop」在无状态路径上的边界：只表示本账号不再原地重发，不等于整条请求没救。
+#[test]
+fn a_retry_stop_on_an_upstream_error_hands_over_to_the_next_candidate() {
+    for status in [400, 402, 403, 404, 429, 500, 502, 503, 504] {
+        assert!(!stateless_stop_ends_request(true, false, false, status), "HTTP {status} 应放行换号");
+    }
+}
+
+#[test]
+fn an_explicit_policy_stop_always_ends_the_request() {
+    // 会话持有待回传的工具结果时，换号会丢状态：任何状态码都不能顺延。
+    for status in [0, 200, 400, 429, 500, 504] {
+        assert!(stateless_stop_ends_request(false, true, false, status), "policy.stop @ {status}");
+        assert!(stateless_stop_ends_request(true, true, false, status), "stop+policy.stop @ {status}");
+    }
+}
+
+#[test]
+fn image_requests_and_non_http_failures_are_never_switched() {
+    // 生图：上游可能已经计费，换号重发会重复扣额度。
+    assert!(stateless_stop_ends_request(true, false, true, 502));
+    // 本地手动终止 / 传输层失败：没有可顺延的上游 4xx/5xx。
+    for status in [0, 200, 399] {
+        assert!(stateless_stop_ends_request(true, false, false, status), "status {status}");
+    }
+}
+
+#[test]
+fn no_stop_signal_means_the_request_continues() {
+    assert!(!stateless_stop_ends_request(false, false, false, 500));
+    assert!(!stateless_stop_ends_request(false, false, true, 500));
+}
